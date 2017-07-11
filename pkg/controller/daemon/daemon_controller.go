@@ -57,6 +57,7 @@ import (
 	"k8s.io/kubernetes/plugin/pkg/scheduler/algorithm"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/algorithm/predicates"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
+	schedutil "k8s.io/kubernetes/plugin/pkg/scheduler/util"
 
 	"github.com/golang/glog"
 )
@@ -903,32 +904,43 @@ func (dsc *DaemonSetsController) syncNodes(ds *extensions.DaemonSet, podsToDelet
 	errCh := make(chan error, createDiff+deleteDiff)
 
 	glog.V(4).Infof("Nodes needing daemon pods for daemon set %s: %+v, creating %d", ds.Name, nodesNeedingDaemonPods, createDiff)
-	createWait := sync.WaitGroup{}
-	createWait.Add(createDiff)
 	template := util.CreatePodTemplate(ds.Spec.Template, ds.Spec.TemplateGeneration, hash)
-	for i := 0; i < createDiff; i++ {
-		go func(ix int) {
-			defer createWait.Done()
-			err := dsc.podControl.CreatePodsOnNode(nodesNeedingDaemonPods[ix], ds.Namespace, &template, ds, metav1.NewControllerRef(ds, controllerKind))
-			if err != nil && errors.IsTimeout(err) {
-				// Pod is created but its initialization has timed out.
-				// If the initialization is successful eventually, the
-				// controller will observe the creation via the informer.
-				// If the initialization fails, or if the pod keeps
-				// uninitialized for a long time, the informer will not
-				// receive any update, and the controller will create a new
-				// pod when the expectation expires.
-				return
-			}
-			if err != nil {
-				glog.V(2).Infof("Failed creation, decrementing expectations for set %q/%q", ds.Namespace, ds.Name)
-				dsc.expectations.CreationObserved(dsKey)
-				errCh <- err
-				utilruntime.HandleError(err)
-			}
-		}(i)
+
+	skippedPods := schedutil.SlowStart(createDiff, func(batchSize, pos int) int {
+		errorCount := len(errCh)
+		createWait := sync.WaitGroup{}
+		createWait.Add(batchSize)
+		for i := pos; i < pos+batchSize; i++ {
+			go func(ix int) {
+				defer createWait.Done()
+				err := dsc.podControl.CreatePodsOnNode(nodesNeedingDaemonPods[ix], ds.Namespace, &template, ds, metav1.NewControllerRef(ds, controllerKind))
+				if err != nil && errors.IsTimeout(err) {
+					// Pod is created but its initialization has timed out.
+					// If the initialization is successful eventually, the
+					// controller will observe the creation via the informer.
+					// If the initialization fails, or if the pod keeps
+					// uninitialized for a long time, the informer will not
+					// receive any update, and the controller will create a new
+					// pod when the expectation expires.
+					return
+				}
+				if err != nil {
+					glog.V(2).Infof("Failed creation, decrementing expectations for set %q/%q", ds.Namespace, ds.Name)
+					dsc.expectations.CreationObserved(dsKey)
+					errCh <- err
+					utilruntime.HandleError(err)
+				}
+			}(i)
+		}
+		createWait.Wait()
+		return len(errCh) - errorCount
+	})
+	if skippedPods > 0 {
+		glog.V(2).Infof("Slow-start failure. Skipping creation of %d pods, decrementing expectations for set %q/%q", skippedPods, ds.Namespace, ds.Name)
+		for i := 0; i < skippedPods; i++ {
+			dsc.expectations.CreationObserved(dsKey)
+		}
 	}
-	createWait.Wait()
 
 	glog.V(4).Infof("Pods to delete for daemon set %s: %+v, deleting %d", ds.Name, podsToDelete, deleteDiff)
 	deleteWait := sync.WaitGroup{}
