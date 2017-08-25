@@ -42,6 +42,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/util/metrics"
+	schedutil "k8s.io/kubernetes/plugin/pkg/scheduler/util"
 
 	"github.com/golang/glog"
 )
@@ -620,34 +621,46 @@ func (jm *JobController) manageJob(activePods []*v1.Pod, succeeded int32, job *b
 
 		active += diff
 		wait := sync.WaitGroup{}
-		wait.Add(int(diff))
-		for i := int32(0); i < diff; i++ {
-			go func() {
-				defer wait.Done()
-				err := jm.podControl.CreatePodsWithControllerRef(job.Namespace, &job.Spec.Template, job, metav1.NewControllerRef(job, controllerKind))
-				if err != nil && errors.IsTimeout(err) {
-					// Pod is created but its initialization has timed out.
-					// If the initialization is successful eventually, the
-					// controller will observe the creation via the informer.
-					// If the initialization fails, or if the pod keeps
-					// uninitialized for a long time, the informer will not
-					// receive any update, and the controller will create a new
-					// pod when the expectation expires.
-					return
-				}
-				if err != nil {
-					defer utilruntime.HandleError(err)
-					// Decrement the expected number of creates because the informer won't observe this pod
-					glog.V(2).Infof("Failed creation, decrementing expectations for job %q/%q", job.Namespace, job.Name)
-					jm.expectations.CreationObserved(jobKey)
-					activeLock.Lock()
-					active--
-					activeLock.Unlock()
-					errCh <- err
-				}
-			}()
+		skippedPods := schedutil.SlowStart(int(diff), func(startCount, _ int) int {
+			errorCount := len(errCh)
+			wait.Add(startCount)
+			for i := 0; i < startCount; i++ {
+				go func() {
+					defer wait.Done()
+					err := jm.podControl.CreatePodsWithControllerRef(job.Namespace, &job.Spec.Template, job, metav1.NewControllerRef(job, controllerKind))
+					if err != nil && errors.IsTimeout(err) {
+						// Pod is created but its initialization has timed out.
+						// If the initialization is successful eventually, the
+						// controller will observe the creation via the informer.
+						// If the initialization fails, or if the pod keeps
+						// uninitialized for a long time, the informer will not
+						// receive any update, and the controller will create a new
+						// pod when the expectation expires.
+						return
+					}
+					if err != nil {
+						defer utilruntime.HandleError(err)
+						// Decrement the expected number of creates because the informer won't observe this pod
+						glog.V(2).Infof("Failed creation, decrementing expectations for job %q/%q", job.Namespace, job.Name)
+						jm.expectations.CreationObserved(jobKey)
+						activeLock.Lock()
+						active--
+						activeLock.Unlock()
+						errCh <- err
+					}
+				}()
+			}
+			wait.Wait()
+			return len(errCh) - errorCount
+		})
+		if skippedPods != 0 {
+			glog.V(2).Infof("Slow-start failure. Skipping creation of %d pods, decrementing expectations for job %q/%q", skippedPods, job.Namespace, job.Name)
+			active -= int32(skippedPods)
+			for i := 0; i < skippedPods; i++ {
+				// Decrement the expected number of creates because the informer won't observe this pod
+				jm.expectations.CreationObserved(jobKey)
+			}
 		}
-		wait.Wait()
 	}
 
 	select {

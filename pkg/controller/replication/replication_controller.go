@@ -44,6 +44,7 @@ import (
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/util/metrics"
+	schedutil "k8s.io/kubernetes/plugin/pkg/scheduler/util"
 )
 
 const (
@@ -446,42 +447,53 @@ func (rm *ReplicationManager) manageReplicas(filteredPods []*v1.Pod, rc *v1.Repl
 		errCh := make(chan error, diff)
 		rm.expectations.ExpectCreations(rcKey, diff)
 		var wg sync.WaitGroup
-		wg.Add(diff)
 		glog.V(2).Infof("Too few %q/%q replicas, need %d, creating %d", rc.Namespace, rc.Name, *(rc.Spec.Replicas), diff)
-		for i := 0; i < diff; i++ {
-			go func() {
-				defer wg.Done()
-				var err error
-				boolPtr := func(b bool) *bool { return &b }
-				controllerRef := &metav1.OwnerReference{
-					APIVersion:         controllerKind.GroupVersion().String(),
-					Kind:               controllerKind.Kind,
-					Name:               rc.Name,
-					UID:                rc.UID,
-					BlockOwnerDeletion: boolPtr(true),
-					Controller:         boolPtr(true),
-				}
-				err = rm.podControl.CreatePodsWithControllerRef(rc.Namespace, rc.Spec.Template, rc, controllerRef)
-				if err != nil && errors.IsTimeout(err) {
-					// Pod is created but its initialization has timed out.
-					// If the initialization is successful eventually, the
-					// controller will observe the creation via the informer.
-					// If the initialization fails, or if the pod keeps
-					// uninitialized for a long time, the informer will not
-					// receive any update, and the controller will create a new
-					// pod when the expectation expires.
-					return
-				}
-				if err != nil {
-					// Decrement the expected number of creates because the informer won't observe this pod
-					glog.V(2).Infof("Failed creation, decrementing expectations for controller %q/%q", rc.Namespace, rc.Name)
-					rm.expectations.CreationObserved(rcKey)
-					errCh <- err
-					utilruntime.HandleError(err)
-				}
-			}()
+		skippedPods := schedutil.SlowStart(diff, func(batchSize, _ int) int {
+			errorCount := len(errCh)
+			wg.Add(batchSize)
+			for i := 0; i < batchSize; i++ {
+				go func() {
+					defer wg.Done()
+					var err error
+					boolPtr := func(b bool) *bool { return &b }
+					controllerRef := &metav1.OwnerReference{
+						APIVersion:         controllerKind.GroupVersion().String(),
+						Kind:               controllerKind.Kind,
+						Name:               rc.Name,
+						UID:                rc.UID,
+						BlockOwnerDeletion: boolPtr(true),
+						Controller:         boolPtr(true),
+					}
+					err = rm.podControl.CreatePodsWithControllerRef(rc.Namespace, rc.Spec.Template, rc, controllerRef)
+					if err != nil && errors.IsTimeout(err) {
+						// Pod is created but its initialization has timed out.
+						// If the initialization is successful eventually, the
+						// controller will observe the creation via the informer.
+						// If the initialization fails, or if the pod keeps
+						// uninitialized for a long time, the informer will not
+						// receive any update, and the controller will create a new
+						// pod when the expectation expires.
+						return
+					}
+					if err != nil {
+						// Decrement the expected number of creates because the informer won't observe this pod
+						glog.V(2).Infof("Failed creation, decrementing expectations for controller %q/%q", rc.Namespace, rc.Name)
+						rm.expectations.CreationObserved(rcKey)
+						errCh <- err
+						utilruntime.HandleError(err)
+					}
+				}()
+			}
+			wg.Wait()
+			return len(errCh) - errorCount
+		})
+		if skippedPods > 0 {
+			glog.V(2).Infof("Slow-start failure. Skipping creation of %d pods, decrementing expectations for controller %q/%q", skippedPods, rc.Namespace, rc.Name)
+			for i := 0; i < skippedPods; i++ {
+				// Decrement the expected number of creates because the informer won't observe this pod
+				rm.expectations.CreationObserved(rcKey)
+			}
 		}
-		wg.Wait()
 
 		select {
 		case err := <-errCh:

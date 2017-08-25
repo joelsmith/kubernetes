@@ -610,11 +610,13 @@ func (r RealPodControl) DeletePod(namespace string, podID string, object runtime
 
 type FakePodControl struct {
 	sync.Mutex
-	Templates      []v1.PodTemplateSpec
-	ControllerRefs []metav1.OwnerReference
-	DeletePodName  []string
-	Patches        [][]byte
-	Err            error
+	Templates       []v1.PodTemplateSpec
+	ControllerRefs  []metav1.OwnerReference
+	DeletePodName   []string
+	Patches         [][]byte
+	Err             error
+	CreateLimit     int
+	CreateCallCount int
 }
 
 var _ PodControlInterface = &FakePodControl{}
@@ -632,6 +634,10 @@ func (f *FakePodControl) PatchPod(namespace, name string, data []byte) error {
 func (f *FakePodControl) CreatePods(namespace string, spec *v1.PodTemplateSpec, object runtime.Object) error {
 	f.Lock()
 	defer f.Unlock()
+	f.CreateCallCount++
+	if f.CreateLimit != 0 && f.CreateCallCount > f.CreateLimit {
+		return fmt.Errorf("Not creating pod, limit %d already reached (create call %d)", f.CreateLimit, f.CreateCallCount)
+	}
 	f.Templates = append(f.Templates, *spec)
 	if f.Err != nil {
 		return f.Err
@@ -642,6 +648,10 @@ func (f *FakePodControl) CreatePods(namespace string, spec *v1.PodTemplateSpec, 
 func (f *FakePodControl) CreatePodsWithControllerRef(namespace string, spec *v1.PodTemplateSpec, object runtime.Object, controllerRef *metav1.OwnerReference) error {
 	f.Lock()
 	defer f.Unlock()
+	f.CreateCallCount++
+	if f.CreateLimit != 0 && f.CreateCallCount > f.CreateLimit {
+		return fmt.Errorf("Not creating pod, limit %d already reached (create call %d)", f.CreateLimit, f.CreateCallCount)
+	}
 	f.Templates = append(f.Templates, *spec)
 	f.ControllerRefs = append(f.ControllerRefs, *controllerRef)
 	if f.Err != nil {
@@ -653,6 +663,10 @@ func (f *FakePodControl) CreatePodsWithControllerRef(namespace string, spec *v1.
 func (f *FakePodControl) CreatePodsOnNode(nodeName, namespace string, template *v1.PodTemplateSpec, object runtime.Object, controllerRef *metav1.OwnerReference) error {
 	f.Lock()
 	defer f.Unlock()
+	f.CreateCallCount++
+	if f.CreateLimit != 0 && f.CreateCallCount > f.CreateLimit {
+		return fmt.Errorf("Not creating pod, limit %d already reached (create call %d)", f.CreateLimit, f.CreateCallCount)
+	}
 	f.Templates = append(f.Templates, *template)
 	f.ControllerRefs = append(f.ControllerRefs, *controllerRef)
 	if f.Err != nil {
@@ -678,6 +692,8 @@ func (f *FakePodControl) Clear() {
 	f.Templates = []v1.PodTemplateSpec{}
 	f.ControllerRefs = []metav1.OwnerReference{}
 	f.Patches = [][]byte{}
+	f.CreateLimit = 0
+	f.CreateCallCount = 0
 }
 
 // ByLogging allows custom sorting of pods so the best one can be picked for getting its logs.
