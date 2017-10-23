@@ -21,8 +21,8 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
-
 	"strings"
+	"syscall"
 
 	"github.com/golang/glog"
 	"k8s.io/api/core/v1"
@@ -88,8 +88,21 @@ func UnmountPath(mountPath string, mounter mount.Interface) error {
 // IsNotMountPoint will be called instead of IsLikelyNotMountPoint.
 // IsNotMountPoint is more expensive but properly handles bind mounts.
 func UnmountMountPoint(mountPath string, mounter mount.Interface, extensiveMountPointCheck bool) error {
-	if pathExists, pathErr := PathExists(mountPath); pathErr != nil {
-		return fmt.Errorf("Error checking if path exists: %v", pathErr)
+	// true in cases when the volume should be unmounted but the check would cause an error
+	skipMountpointCheck := false
+	if pathExists, err := PathExists(mountPath); err != nil {
+		if pathErr, ok := err.(*os.PathError); ok && pathErr.Err == syscall.ENOTCONN {
+			// In the case of a volume that uses a kube endpoint for its transport,
+			// if the ep has already been deleted, we still want to unmount
+			if _, err := os.Stat(path.Dir(mountPath)); err == nil {
+				// If the transport endpoint is not connected, but the parent directory is accessible,
+				// the check can be safely skipped. The unmount should be performed.
+				skipMountpointCheck = true
+				glog.V(3).Infof("Proceeding with possible unclean unmount despite error: %v", err)
+			}
+		} else {
+			return fmt.Errorf("Error checking if path exists: %v", err)
+		}
 	} else if !pathExists {
 		glog.Warningf("Warning: Unmount skipped because path does not exist: %v", mountPath)
 		return nil
@@ -98,19 +111,21 @@ func UnmountMountPoint(mountPath string, mounter mount.Interface, extensiveMount
 	var notMnt bool
 	var err error
 
-	if extensiveMountPointCheck {
-		notMnt, err = mount.IsNotMountPoint(mounter, mountPath)
-	} else {
-		notMnt, err = mounter.IsLikelyNotMountPoint(mountPath)
-	}
+	if !skipMountpointCheck {
+		if extensiveMountPointCheck {
+			notMnt, err = mount.IsNotMountPoint(mounter, mountPath)
+		} else {
+			notMnt, err = mounter.IsLikelyNotMountPoint(mountPath)
+		}
 
-	if err != nil {
-		return err
-	}
+		if err != nil {
+			return err
+		}
 
-	if notMnt {
-		glog.Warningf("Warning: %q is not a mountpoint, deleting", mountPath)
-		return os.Remove(mountPath)
+		if notMnt {
+			glog.Warningf("Warning: %q is not a mountpoint, deleting", mountPath)
+			return os.Remove(mountPath)
+		}
 	}
 
 	// Unmount the mount path
@@ -120,7 +135,7 @@ func UnmountMountPoint(mountPath string, mounter mount.Interface, extensiveMount
 	}
 	notMnt, mntErr := mounter.IsLikelyNotMountPoint(mountPath)
 	if mntErr != nil {
-		return err
+		return mntErr
 	}
 	if notMnt {
 		glog.V(4).Infof("%q is unmounted, deleting the directory", mountPath)
