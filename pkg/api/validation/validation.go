@@ -2962,14 +2962,19 @@ func ValidatePodUpdate(newPod, oldPod *api.Pod) field.ErrorList {
 	return allErrs
 }
 
-func ValidateContainerStateTransition(newStatuses, oldStatuses []api.ContainerStatus, fldpath *field.Path) field.ErrorList {
+func ValidateContainerStateTransition(newStatuses, oldStatuses []api.ContainerStatus, fldpath *field.Path, restartPolicy api.RestartPolicy) field.ErrorList {
 	allErrs := field.ErrorList{}
+	// If we should "Always" restart, containers are allowed to leave the terminated state
+	if restartPolicy == api.RestartPolicyAlways {
+		return allErrs
+	}
 	for i, oldStatus := range oldStatuses {
+		// skip anything that wasn't terminated, or any failed pods (in the RestartPolicyOnFailure case). Those can transition.
+		if oldStatus.State.Terminated == nil || restartPolicy == api.RestartPolicyOnFailure && oldStatus.State.Terminated.ExitCode != 0 {
+			continue
+		}
 		for _, newStatus := range newStatuses {
-			if oldStatus.Name != newStatus.Name {
-				continue
-			}
-			if oldStatus.State.Terminated != nil && newStatus.State.Terminated == nil {
+			if oldStatus.Name == newStatus.Name && newStatus.State.Terminated == nil {
 				allErrs = append(allErrs, field.Forbidden(fldpath.Index(i).Child("state"), "may not be transitioned to non-terminated state"))
 			}
 		}
@@ -2991,10 +2996,8 @@ func ValidatePodStatusUpdate(newPod, oldPod *api.Pod) field.ErrorList {
 
 	// If pod should never restart, make sure the status update doesn't transition
 	// any terminated containers to a non-terminated state.
-	if oldPod.Spec.RestartPolicy == api.RestartPolicyNever {
-		allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.ContainerStatuses, oldPod.Status.ContainerStatuses, fldPath.Child("containerStatuses"))...)
-		allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.InitContainerStatuses, oldPod.Status.InitContainerStatuses, fldPath.Child("initContainerStatuses"))...)
-	}
+	allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.ContainerStatuses, oldPod.Status.ContainerStatuses, fldPath.Child("containerStatuses"), oldPod.Spec.RestartPolicy)...)
+	allErrs = append(allErrs, ValidateContainerStateTransition(newPod.Status.InitContainerStatuses, oldPod.Status.InitContainerStatuses, fldPath.Child("initContainerStatuses"), oldPod.Spec.RestartPolicy)...)
 
 	// For status update we ignore changes to pod spec.
 	newPod.Spec = oldPod.Spec
